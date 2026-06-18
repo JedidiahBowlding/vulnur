@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 
 const API_BASE = import.meta.env.VITE_API_URL || "http://localhost:8000";
+const CONTRACTS_CACHE_KEY = "contract_monitor_contracts_cache_v1";
+const CONTRACTS_CACHE_TTL_MS = 10 * 60 * 1000;
 
 const EXPLOIT_PLAYBOOKS = {
   upgradeable_logic: {
@@ -15,6 +17,12 @@ const EXPLOIT_PLAYBOOKS = {
     ],
     impact: "Full contract takeover and potential direct fund loss.",
     monitor: "Unexpected implementation change events and out-of-window upgrade transactions.",
+    economics: {
+      fundsPct: [0.0001, 0.006],
+      fundsFloorEth: [0.15, 3],
+      profitPct: [0.04, 0.6],
+      profitFloorEth: [1.5, 25],
+    },
   },
   admin_pause_control: {
     title: "Admin Pause Control Abuse",
@@ -28,6 +36,12 @@ const EXPLOIT_PLAYBOOKS = {
     ],
     impact: "Operational denial of service, governance abuse, and possible treasury or user loss.",
     monitor: "Pause events closely followed by admin-only parameter changes or fund movements.",
+    economics: {
+      fundsPct: [0.00005, 0.003],
+      fundsFloorEth: [0.05, 1.5],
+      profitPct: [0.01, 0.2],
+      profitFloorEth: [0.25, 6],
+    },
   },
   external_call_surface: {
     title: "External Call / Callback Abuse",
@@ -41,6 +55,12 @@ const EXPLOIT_PLAYBOOKS = {
     ],
     impact: "Accounting corruption and potential unauthorized withdrawals.",
     monitor: "Repeated nested calls to same function and unusual balance deltas in one transaction.",
+    economics: {
+      fundsPct: [0.002, 0.12],
+      fundsFloorEth: [1, 20],
+      profitPct: [0.03, 0.35],
+      profitFloorEth: [1, 18],
+    },
   },
   oracle_dependency: {
     title: "Oracle Manipulation / Stale Price Exploit",
@@ -54,9 +74,18 @@ const EXPLOIT_PLAYBOOKS = {
     ],
     impact: "Bad debt creation, liquidation cascades, and insolvency pressure.",
     monitor: "Large short-lived price deviations near sensitive protocol actions.",
+    economics: {
+      fundsPct: [0.03, 0.35],
+      fundsFloorEth: [25, 250],
+      profitPct: [0.02, 0.25],
+      profitFloorEth: [4, 60],
+    },
   },
   slither_nonzero_exit: {
     title: "Static Analysis Failure Triage",
+    fundsMarker: "N/A",
+    estimatedFunds: "No direct exploit budget; this is a coverage gap that requires manual review.",
+    estimatedProfit: "N/A until a concrete exploit path is validated.",
     where: "Analyzer-incomplete or parser-sensitive code paths flagged by Slither run status.",
     how: "Not directly exploitable by itself, but can hide unresolved real issues unless manually triaged.",
     sequence: [
@@ -70,21 +99,166 @@ const EXPLOIT_PLAYBOOKS = {
   },
 };
 
+const DEFAULT_ECONOMICS = {
+  fundsPct: [0.001, 0.08],
+  fundsFloorEth: [0.5, 10],
+  profitPct: [0.01, 0.2],
+  profitFloorEth: [0.5, 8],
+};
+
+function toFiniteNumber(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function formatEthEstimate(value) {
+  if (value >= 1000) return `${value.toLocaleString(undefined, { maximumFractionDigits: 0 })} ETH`;
+  if (value >= 100) return `${value.toFixed(1)} ETH`;
+  if (value >= 1) return `${value.toFixed(2)} ETH`;
+  return `${value.toFixed(3)} ETH`;
+}
+
+function formatEthEstimateRange(low, high) {
+  return `${formatEthEstimate(low)} - ${formatEthEstimate(high)}`;
+}
+
+function computeRangeFromLiquidity(liquidityEth, pctRange, floorRange) {
+  const [pctLow, pctHigh] = pctRange;
+  const [floorLow, floorHigh] = floorRange;
+
+  const low = Math.max(floorLow, liquidityEth * pctLow);
+  const uncappedHigh = Math.max(low, Math.max(floorHigh, liquidityEth * pctHigh));
+  const highCap = liquidityEth > 0 ? liquidityEth * 0.9 : uncappedHigh;
+  const high = Math.max(low, Math.min(uncappedHigh, highCap));
+
+  return [low, high];
+}
+
+function markerFromCapitalRange(highEth, liquidityEth) {
+  if (liquidityEth <= 0) return "Unknown";
+  const ratio = highEth / Math.max(liquidityEth, 1e-9);
+  if (ratio <= 0.01) return "Low Capital";
+  if (ratio <= 0.1) return "Medium Capital";
+  return "High Capital";
+}
+
+function deriveLiquidityContext(row, profile) {
+  const directLiquidityEth = Math.max(0, toFiniteNumber(row?.liquidity_eth));
+  if (directLiquidityEth > 0) {
+    return {
+      effectiveLiquidityEth: directLiquidityEth,
+      source: "onchain_eth_balance",
+      sourceLabel: "On-chain contract ETH balance",
+    };
+  }
+
+  const currentEthBalance = Math.max(
+    0,
+    toFiniteNumber(profile?.balance_value_flow?.current_eth_balance_wei) / 1e18
+  );
+  const incomingEth = Math.max(
+    0,
+    toFiniteNumber(profile?.balance_value_flow?.total_incoming_wei) / 1e18
+  );
+  const outgoingEth = Math.max(
+    0,
+    toFiniteNumber(profile?.balance_value_flow?.total_outgoing_wei) / 1e18
+  );
+  const flowProxyEth = Math.max(currentEthBalance, (incomingEth + outgoingEth) / 2);
+
+  if (flowProxyEth > 0) {
+    return {
+      effectiveLiquidityEth: flowProxyEth,
+      source: "profile_value_flow",
+      sourceLabel: "Etherscan value-flow proxy",
+    };
+  }
+
+  const activityScore = Math.max(0, toFiniteNumber(row?.activity_score));
+  const normalTx = Math.max(
+    0,
+    toFiniteNumber(profile?.transfer_activity_metrics?.normal_tx_count)
+  );
+  const tokenTx = Math.max(
+    0,
+    toFiniteNumber(profile?.transfer_activity_metrics?.token_transfer_count)
+  );
+  const internalTx = Math.max(
+    0,
+    toFiniteNumber(profile?.transfer_activity_metrics?.internal_tx_count)
+  );
+  const weightedActivity = normalTx + tokenTx + internalTx * 0.5;
+
+  const activityProxyEth = Math.max(
+    20,
+    activityScore * 15,
+    Math.sqrt(Math.max(weightedActivity, 1)) * 30
+  );
+
+  return {
+    effectiveLiquidityEth: activityProxyEth,
+    source: "activity_proxy",
+    sourceLabel: "Activity-derived liquidity proxy",
+  };
+}
+
+function computePlaybookEconomics(playbook, liquidityContext) {
+  if (playbook.estimatedFunds || playbook.estimatedProfit) {
+    return {
+      fundsMarker: playbook.fundsMarker || "N/A",
+      estimatedFunds:
+        playbook.estimatedFunds || "No direct exploit budget; manual analysis required.",
+      estimatedProfit:
+        playbook.estimatedProfit || "N/A until a concrete exploit path is validated.",
+    };
+  }
+
+  const normalizedLiquidity = Math.max(
+    0,
+    toFiniteNumber(liquidityContext?.effectiveLiquidityEth)
+  );
+  if (normalizedLiquidity <= 0) {
+    return {
+      fundsMarker: "Unknown",
+      estimatedFunds: "Unknown (liquidity data unavailable for this contract).",
+      estimatedProfit: "Unknown until liquidity and execution path are validated.",
+    };
+  }
+
+  const econ = playbook.economics || DEFAULT_ECONOMICS;
+  const [fundsLow, fundsHigh] = computeRangeFromLiquidity(
+    normalizedLiquidity,
+    econ.fundsPct,
+    econ.fundsFloorEth
+  );
+  const [profitLow, profitHigh] = computeRangeFromLiquidity(
+    normalizedLiquidity,
+    econ.profitPct,
+    econ.profitFloorEth
+  );
+
+  return {
+    fundsMarker: markerFromCapitalRange(fundsHigh, normalizedLiquidity),
+    estimatedFunds: `${formatEthEstimateRange(fundsLow, fundsHigh)} (scaled from ${liquidityContext?.sourceLabel || "liquidity proxy"})`,
+    estimatedProfit: `${formatEthEstimateRange(profitLow, profitHigh)} potential extracted value (scenario-dependent)`,
+  };
+}
+
 function normalizeFindingTag(vulnerability) {
   const lowered = String(vulnerability || "").toLowerCase();
   if (lowered.startsWith("defi_risk:")) return lowered.split(":")[1] || lowered;
   return lowered;
 }
 
-function buildExploitPlaybooks(vulnerabilities) {
+function buildExploitPlaybooks(vulnerabilities, liquidityContext) {
   const uniqueKeys = [...new Set((vulnerabilities || []).map(normalizeFindingTag))];
   return uniqueKeys.map((key) => {
     const template = EXPLOIT_PLAYBOOKS[key];
     if (template) {
-      return { key, ...template };
+      const economics = computePlaybookEconomics(template, liquidityContext);
+      return { key, ...template, ...economics };
     }
-    return {
-      key,
+    const fallbackTemplate = {
       title: `Manual Review Playbook: ${key || "unknown_finding"}`,
       where: "Inspect the exact function path flagged by the scanner in source and runtime traces.",
       how: "Attacker may combine this condition with privilege misuse, ordering bugs, or integration assumptions.",
@@ -96,6 +270,13 @@ function buildExploitPlaybooks(vulnerabilities) {
       ],
       impact: "Potentially meaningful risk; exploitability must be confirmed by targeted testing.",
       monitor: "Alert on function usage spikes and anomalous state transitions around this path.",
+      economics: DEFAULT_ECONOMICS,
+    };
+    const economics = computePlaybookEconomics(fallbackTemplate, liquidityContext);
+    return {
+      key,
+      ...fallbackTemplate,
+      ...economics,
     };
   });
 }
@@ -178,7 +359,7 @@ function buildClientBrief(row) {
   return [...header, ...sections].join("\n");
 }
 
-function DashboardPage({ rows, loading, error, onRefresh, minLiquidityEth, maxLiquidityEth, onMinLiquidityChange, onMaxLiquidityChange, search, onSearchChange }) {
+function DashboardPage({ rows, loading, error, onRefresh, minLiquidityEth, maxLiquidityEth, onMinLiquidityChange, onMaxLiquidityChange, search, onSearchChange, cacheFetchedAt }) {
   const metrics = useMemo(() => {
     const total = rows.length;
     const vulnerable = rows.filter((r) => r.vulnerabilities?.length > 0).length;
@@ -220,6 +401,11 @@ function DashboardPage({ rows, loading, error, onRefresh, minLiquidityEth, maxLi
       <section className="panel">
         <div className="panel-head">
           <h2>Recent Scan Results</h2>
+          {cacheFetchedAt ? (
+            <p className="cache-age-label" aria-live="polite">
+              Cached {Math.max(0, Math.floor((Date.now() - cacheFetchedAt) / 60000))} min ago
+            </p>
+          ) : null}
           <div className="panel-controls">
             <input
               type="text"
@@ -445,7 +631,12 @@ function ContractDetailPage({ row, reportMode, reportGeneratedAt }) {
       ? sortedDetails
       : sortedDetails.filter((detail) => detail.severity === severityFilter);
 
-  const exploitPlaybooks = buildExploitPlaybooks(row.vulnerabilities || []);
+  const liquidityContext = deriveLiquidityContext(row, profile);
+
+  const exploitPlaybooks = buildExploitPlaybooks(
+    row.vulnerabilities || [],
+    liquidityContext
+  );
 
   const severityCounts = (row.vulnerability_details || []).reduce(
     (acc, detail) => {
@@ -720,9 +911,24 @@ function ContractDetailPage({ row, reportMode, reportGeneratedAt }) {
           <p className="playbooks-intro">
             Automatically generated from scan findings to guide manual validation and incident response.
           </p>
+          <p className="playbooks-intro">
+            Estimated attacker budget ranges are directional only and should be validated against live liquidity and execution traces.
+          </p>
+          <p className="playbooks-intro">
+            Liquidity source for this contract: {liquidityContext.sourceLabel} (~{formatEthEstimate(liquidityContext.effectiveLiquidityEth)} reference liquidity).
+          </p>
           {exploitPlaybooks.map((playbook) => (
             <article key={playbook.key} className="playbook-card">
-              <h3>{playbook.title}</h3>
+              <h3 className="playbook-title-row">
+                <span>{playbook.title}</span>
+                <span className="playbook-price-marker">{playbook.fundsMarker}</span>
+              </h3>
+              <p>
+                <strong>Estimated attacker funds needed:</strong> {playbook.estimatedFunds}
+              </p>
+              <p>
+                <strong>Estimated profit outcome:</strong> {playbook.estimatedProfit}
+              </p>
               <p>
                 <strong>Where the vulnerability is:</strong> {playbook.where}
               </p>
@@ -761,11 +967,12 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [route, setRoute] = useState(getRouteState);
+  const [cacheFetchedAt, setCacheFetchedAt] = useState(null);
   const [minLiquidityEth, setMinLiquidityEth] = useState("");
   const [maxLiquidityEth, setMaxLiquidityEth] = useState("");
   const [search, setSearch] = useState("");
 
-  const loadData = async () => {
+  const loadData = async ({ force = false } = {}) => {
     setError("");
     setLoading(true);
     try {
@@ -774,10 +981,51 @@ export default function App() {
       if (maxLiquidityEth !== "") params.set("max_liquidity_eth", maxLiquidityEth);
       if (search !== "") params.set("search", search);
 
+      const queryKey = params.toString();
+
+      if (!force) {
+        try {
+          const cachedRaw = window.localStorage.getItem(CONTRACTS_CACHE_KEY);
+          if (cachedRaw) {
+            const cached = JSON.parse(cachedRaw);
+            const age = Date.now() - Number(cached?.timestamp || 0);
+            if (
+              cached?.queryKey === queryKey
+              && Array.isArray(cached?.rows)
+              && age >= 0
+              && age <= CONTRACTS_CACHE_TTL_MS
+            ) {
+              setRows(cached.rows);
+              setCacheFetchedAt(Number(cached.timestamp) || null);
+              setLoading(false);
+              return;
+            }
+          }
+        } catch {
+          // Ignore cache parsing/storage errors and continue with network fetch.
+        }
+      }
+
       const response = await fetch(`${API_BASE}/api/contracts?${params.toString()}`);
       if (!response.ok) throw new Error("Failed to load dashboard data");
       const data = await response.json();
       setRows(data);
+      setCacheFetchedAt(Date.now());
+
+      try {
+        const now = Date.now();
+        window.localStorage.setItem(
+          CONTRACTS_CACHE_KEY,
+          JSON.stringify({
+            queryKey,
+            rows: data,
+            timestamp: now,
+          })
+        );
+        setCacheFetchedAt(now);
+      } catch {
+        // Ignore storage quota/permission issues.
+      }
     } catch (err) {
       setError(err.message || "Unknown error");
     } finally {
@@ -787,8 +1035,6 @@ export default function App() {
 
   useEffect(() => {
     loadData();
-    const id = setInterval(loadData, 15000);
-    return () => clearInterval(id);
   }, [minLiquidityEth, maxLiquidityEth, search]);
 
   useEffect(() => {
@@ -827,7 +1073,8 @@ export default function App() {
           rows={rows}
           loading={loading}
           error={error}
-          onRefresh={loadData}
+          onRefresh={() => loadData({ force: true })}
+          cacheFetchedAt={cacheFetchedAt}
           minLiquidityEth={minLiquidityEth}
           maxLiquidityEth={maxLiquidityEth}
           onMinLiquidityChange={setMinLiquidityEth}
