@@ -473,6 +473,44 @@ tbody tr {
   line-height: 1.5;
 }
 
+.playbooks-section {
+  margin-top: 14px;
+  border-top: 1px solid var(--line);
+  padding-top: 10px;
+}
+
+.playbooks-intro {
+  margin: 0 0 10px;
+  color: #4f473b;
+}
+
+.playbook-card {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #fffdf8;
+  padding: 12px;
+  margin-bottom: 10px;
+}
+
+.playbook-card h3 {
+  margin: 0 0 8px;
+  font-size: 1rem;
+}
+
+.playbook-card p {
+  margin: 7px 0;
+  line-height: 1.45;
+}
+
+.playbook-sequence {
+  margin: 0;
+  padding-left: 18px;
+}
+
+.playbook-sequence li {
+  margin: 5px 0;
+}
+
 .finding-head {
   display: flex;
   justify-content: space-between;
@@ -649,6 +687,13 @@ tbody tr {
     page-break-inside: avoid;
     break-inside: avoid;
     border-top: 1px solid #ddd;
+  }
+
+  .playbook-card {
+    page-break-inside: avoid;
+    break-inside: avoid;
+    border-color: #bbb;
+    background: transparent;
   }
 
   .finding-card h3,

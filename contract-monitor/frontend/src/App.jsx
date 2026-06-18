@@ -2,6 +2,104 @@ import { useEffect, useMemo, useState } from "react";
 
 const API_BASE = import.meta.env.VITE_API_URL || "http://localhost:8000";
 
+const EXPLOIT_PLAYBOOKS = {
+  upgradeable_logic: {
+    title: "Upgradeable Logic Abuse",
+    where: "Proxy admin paths, implementation setters, delegatecall upgrade routines.",
+    how: "Attacker abuses weak upgrade authorization or compromised admin keys to swap malicious logic.",
+    sequence: [
+      "Deploy malicious implementation contract.",
+      "Trigger upgrade function to point proxy to malicious implementation.",
+      "Call privileged initializer or role-setting function.",
+      "Execute drain, mint, or permission hijack routines.",
+    ],
+    impact: "Full contract takeover and potential direct fund loss.",
+    monitor: "Unexpected implementation change events and out-of-window upgrade transactions.",
+  },
+  admin_pause_control: {
+    title: "Admin Pause Control Abuse",
+    where: "Owner/admin modifiers and emergency pause-unpause functions.",
+    how: "Compromised or malicious admin pauses user actions, then changes protocol state in a privileged window.",
+    sequence: [
+      "Call pause function to halt normal user operations.",
+      "Change sensitive parameters while users cannot react.",
+      "Execute privileged transfers or role updates.",
+      "Unpause with attacker-favorable configuration in place.",
+    ],
+    impact: "Operational denial of service, governance abuse, and possible treasury or user loss.",
+    monitor: "Pause events closely followed by admin-only parameter changes or fund movements.",
+  },
+  external_call_surface: {
+    title: "External Call / Callback Abuse",
+    where: "Functions issuing low-level calls, staticcall/delegatecall, or third-party protocol callbacks.",
+    how: "Attacker contract re-enters or manipulates callback assumptions before internal state finalization.",
+    sequence: [
+      "Deploy attacker callback contract.",
+      "Invoke target function that performs external call before state updates.",
+      "Re-enter vulnerable function during callback.",
+      "Repeat until limits or balances are bypassed/drained.",
+    ],
+    impact: "Accounting corruption and potential unauthorized withdrawals.",
+    monitor: "Repeated nested calls to same function and unusual balance deltas in one transaction.",
+  },
+  oracle_dependency: {
+    title: "Oracle Manipulation / Stale Price Exploit",
+    where: "Borrow, collateral, liquidation, mint, or redemption paths reading price feeds.",
+    how: "Attacker distorts or races oracle-dependent pricing to execute underpriced borrows or favorable liquidations.",
+    sequence: [
+      "Use large temporary capital (often flash liquidity).",
+      "Distort reference market or exploit stale update window.",
+      "Trigger borrow/liquidation/redemption using manipulated price.",
+      "Restore market and keep extracted value spread.",
+    ],
+    impact: "Bad debt creation, liquidation cascades, and insolvency pressure.",
+    monitor: "Large short-lived price deviations near sensitive protocol actions.",
+  },
+  slither_nonzero_exit: {
+    title: "Static Analysis Failure Triage",
+    where: "Analyzer-incomplete or parser-sensitive code paths flagged by Slither run status.",
+    how: "Not directly exploitable by itself, but can hide unresolved real issues unless manually triaged.",
+    sequence: [
+      "Re-run static analysis with pinned compiler/dependency versions.",
+      "Isolate failing detectors or source regions.",
+      "Stress privileged and boundary-case function inputs.",
+      "Escalate any unexpected state transition to exploit candidate.",
+    ],
+    impact: "False sense of safety if unresolved findings are ignored.",
+    monitor: "Repeated non-zero analyzer exits on same contracts or same function families.",
+  },
+};
+
+function normalizeFindingTag(vulnerability) {
+  const lowered = String(vulnerability || "").toLowerCase();
+  if (lowered.startsWith("defi_risk:")) return lowered.split(":")[1] || lowered;
+  return lowered;
+}
+
+function buildExploitPlaybooks(vulnerabilities) {
+  const uniqueKeys = [...new Set((vulnerabilities || []).map(normalizeFindingTag))];
+  return uniqueKeys.map((key) => {
+    const template = EXPLOIT_PLAYBOOKS[key];
+    if (template) {
+      return { key, ...template };
+    }
+    return {
+      key,
+      title: `Manual Review Playbook: ${key || "unknown_finding"}`,
+      where: "Inspect the exact function path flagged by the scanner in source and runtime traces.",
+      how: "Attacker may combine this condition with privilege misuse, ordering bugs, or integration assumptions.",
+      sequence: [
+        "Identify caller permissions and trust boundaries.",
+        "Attempt boundary-case inputs and unexpected call ordering.",
+        "Trace state changes before and after external interactions.",
+        "Confirm whether value, roles, or invariants can be violated.",
+      ],
+      impact: "Potentially meaningful risk; exploitability must be confirmed by targeted testing.",
+      monitor: "Alert on function usage spikes and anomalous state transitions around this path.",
+    };
+  });
+}
+
 function formatDate(input) {
   try {
     return new Date(input).toLocaleString();
@@ -347,6 +445,8 @@ function ContractDetailPage({ row, reportMode, reportGeneratedAt }) {
       ? sortedDetails
       : sortedDetails.filter((detail) => detail.severity === severityFilter);
 
+  const exploitPlaybooks = buildExploitPlaybooks(row.vulnerabilities || []);
+
   const severityCounts = (row.vulnerability_details || []).reduce(
     (acc, detail) => {
       const level = detail.severity || "informational";
@@ -613,6 +713,38 @@ function ContractDetailPage({ row, reportMode, reportGeneratedAt }) {
       ) : (
         <p className="empty-detail">No findings match the selected severity filter.</p>
       )}
+
+      {exploitPlaybooks.length ? (
+        <section className="playbooks-section">
+          <h2>Exploit Playbooks</h2>
+          <p className="playbooks-intro">
+            Automatically generated from scan findings to guide manual validation and incident response.
+          </p>
+          {exploitPlaybooks.map((playbook) => (
+            <article key={playbook.key} className="playbook-card">
+              <h3>{playbook.title}</h3>
+              <p>
+                <strong>Where the vulnerability is:</strong> {playbook.where}
+              </p>
+              <p>
+                <strong>How it can be exploited:</strong> {playbook.how}
+              </p>
+              <p><strong>Concrete attacker transaction sequence:</strong></p>
+              <ol className="playbook-sequence">
+                {playbook.sequence.map((step, idx) => (
+                  <li key={`${playbook.key}-${idx}`}>{step}</li>
+                ))}
+              </ol>
+              <p>
+                <strong>Likely impact:</strong> {playbook.impact}
+              </p>
+              <p>
+                <strong>What to monitor:</strong> {playbook.monitor}
+              </p>
+            </article>
+          ))}
+        </section>
+      ) : null}
 
       {reportMode ? (
         <footer className="report-footer">

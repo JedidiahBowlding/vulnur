@@ -101,8 +101,7 @@ class AnalysisRunner:
 
     async def _run_echidna(self, source_code: str) -> tuple[list[str], str]:
         with tempfile.TemporaryDirectory(prefix="monitor-echidna-") as temp_dir:
-            source_path = Path(temp_dir) / "ScannedContract.sol"
-            source_path.write_text(source_code, encoding="utf-8")
+            source_path = self._materialize_source_tree(source_code, Path(temp_dir))
             cmd = [
                 self.settings.echidna_cmd,
                 str(source_path),
@@ -111,7 +110,80 @@ class AnalysisRunner:
                 "--format",
                 "json",
             ]
-            return await self._run_tool("echidna", cmd)
+            findings, summary = await self._run_tool("echidna", cmd)
+            if findings or "no echidna properties found" not in summary:
+                return findings, summary
+
+            # Retry in assertion mode when ABI properties are absent.
+            assertion_cmd = [*cmd, "--test-mode", "assertion"]
+            assert_findings, assert_summary = await self._run_tool("echidna", assertion_cmd)
+            if assert_findings:
+                return assert_findings, assert_summary
+            if assert_summary == "echidna: no findings":
+                return [], "echidna: no findings (assertion mode)"
+            if "no echidna properties found" in assert_summary:
+                return [], "echidna: skipped (no properties/assertions found)"
+            return [], assert_summary
+
+    def _materialize_source_tree(self, source_code: str, root_dir: Path) -> Path:
+        try:
+            parsed = json.loads(source_code)
+        except Exception:
+            parsed = None
+
+        if isinstance(parsed, dict) and isinstance(parsed.get("sources"), dict):
+            sources: dict[str, object] = parsed["sources"]
+            written_paths: list[Path] = []
+
+            for source_name, source_meta in sources.items():
+                content: str | None = None
+                if isinstance(source_meta, dict):
+                    raw_content = source_meta.get("content")
+                    if isinstance(raw_content, str):
+                        content = raw_content
+                elif isinstance(source_meta, str):
+                    content = source_meta
+
+                if content is None:
+                    continue
+
+                file_path = root_dir / self._sanitize_source_path(source_name)
+                file_path.parent.mkdir(parents=True, exist_ok=True)
+                file_path.write_text(content, encoding="utf-8")
+                written_paths.append(file_path)
+
+            if written_paths:
+                target = self._select_compilation_target(parsed)
+                if target:
+                    target_path = root_dir / self._sanitize_source_path(target)
+                    if target_path.exists():
+                        return target_path
+                return written_paths[0]
+
+        source_path = root_dir / "ScannedContract.sol"
+        source_path.write_text(source_code, encoding="utf-8")
+        return source_path
+
+    def _select_compilation_target(self, parsed_source: dict[str, object]) -> str | None:
+        settings = parsed_source.get("settings")
+        if not isinstance(settings, dict):
+            return None
+
+        compilation_target = settings.get("compilationTarget")
+        if not isinstance(compilation_target, dict):
+            return None
+
+        for source_name in compilation_target.keys():
+            if isinstance(source_name, str) and source_name:
+                return source_name
+        return None
+
+    def _sanitize_source_path(self, source_name: str) -> Path:
+        normalized = source_name.replace("\\", "/")
+        parts = [part for part in Path(normalized).parts if part not in ("", ".", "..")]
+        if not parts:
+            return Path("ScannedContract.sol")
+        return Path(*parts)
 
     async def _run_tool(self, name: str, cmd: list[str]) -> tuple[list[str], str]:
         executable = cmd[0]
@@ -159,7 +231,15 @@ class AnalysisRunner:
         if tool == "echidna":
             if "abi is empty" in lowered:
                 return "echidna: skipped (no testable ABI/functions found)"
+            if "no tests found in abi" in lowered:
+                return "echidna: skipped (no echidna properties found)"
+            if "no assert" in lowered and "found" in lowered:
+                return "echidna: skipped (no properties/assertions found)"
             if "doesn't support versions of solc before" in lowered:
+                return "echidna: skipped (unsupported compiler version)"
+            if "expected ';' but got identifier" in lowered and "immutable" in lowered:
+                return "echidna: skipped (unsupported compiler version)"
+            if "source file requires different compiler version" in lowered:
                 return "echidna: skipped (unsupported compiler version)"
             if "constructor arguments are required" in lowered:
                 return "echidna: skipped (constructor arguments required)"
