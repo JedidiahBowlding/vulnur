@@ -1,0 +1,27 @@
+# Environment files
+.env
+**/.env
+.env.*
+**/.env.*
+
+# Keep template env files committed
+!.env.example
+!**/.env.example
+
+# JavaScript dependencies/build caches
+node_modules/
+**/node_modules/
+.vite/
+**/.vite/
+
+# Python caches/virtualenvs
+__pycache__/
+**/__pycache__/
+*.pyc
+.venv/
+venv/
+test_venv/
+**/test_venv/
+
+# Local runtime data
+*.db
