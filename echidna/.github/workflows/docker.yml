@@ -1,0 +1,160 @@
+name: Docker
+
+on:
+  push:
+    branches:
+      - master
+    tags:
+      - '*'
+
+permissions: {}
+
+jobs:
+  build:
+    name: build ${{ matrix.platform }} container
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            os: ubuntu-latest
+          - platform: linux/arm64
+            os: ubuntu-24.04-arm
+    steps:
+      - name: Prepare
+        run: |
+          echo "PLATFORM_PAIR=${PLATFORM//\//-}" >> "$GITHUB_ENV"
+        env:
+          PLATFORM: "${{ matrix.platform }}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4
+        id: buildx
+        with:
+          install: true
+
+      - name: Set Docker metadata (Ubuntu & NVM variant)
+        id: meta-ubuntu
+        uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6
+        with:
+          images: |
+            ghcr.io/${{ github.repository }}/echidna
+            name=trailofbits/echidna,enable=${{ github.repository == 'crytic/echidna' }}
+          tags: |
+            type=ref,event=tag
+            type=ref,event=branch,prefix=testing-
+            type=edge
+
+      - name: Extract image names (Ubuntu & NVM variant)
+        id: name-ubuntu
+        run: |
+          {
+            echo -n "name="
+            jq -cr '.tags | map(split(":")[0]) | unique | join(",")' <<< "$DOCKER_METADATA_OUTPUT_JSON"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: GitHub Container Registry Login
+        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker Hub Login
+        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4
+        if: github.repository == 'crytic/echidna'
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_ACCESS_TOKEN }}
+
+      - name: Docker Build and Push (Ubuntu & NVM variant)
+        uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7
+        id: build-ubuntu
+        with:
+          platforms: ${{ matrix.platform }}
+          target: final-ubuntu
+          file: docker/Dockerfile
+          pull: true
+          outputs: type=image,"name=${{ steps.name-ubuntu.outputs.name }}",push-by-digest=true,push=true
+          labels: ${{ steps.meta-ubuntu.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Export digest
+        run: |
+          mkdir -p "$RUNNER_TEMP/digests/ubuntu"
+          touch "$RUNNER_TEMP/digests/ubuntu/${DIGEST_UBUNTU#sha256:}"
+        env:
+          DIGEST_UBUNTU: "${{ steps.build-ubuntu.outputs.digest }}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        with:
+          name: digests-${{ env.PLATFORM_PAIR }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: merge containers
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    needs:
+      - build
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: GitHub Container Registry Login
+        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker Hub Login
+        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4
+        if: github.repository == 'crytic/echidna'
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_ACCESS_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4
+
+      - name: Set Docker metadata (Ubuntu & NVM variant)
+        id: meta-ubuntu
+        uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6
+        with:
+          images: |
+            ghcr.io/${{ github.repository }}/echidna
+            name=trailofbits/echidna,enable=${{ github.repository == 'crytic/echidna' }}
+          tags: |
+            type=ref,event=tag
+            type=ref,event=branch,prefix=testing-
+            type=edge
+
+      - name: Create manifest list and push (Ubuntu & NVM variant)
+        working-directory: ${{ runner.temp }}/digests/ubuntu
+        run: |
+          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf "$IMAGE_NAME@sha256:%s " *)
+        env:
+          IMAGE_NAME: ghcr.io/${{ github.repository }}/echidna
+
+      - name: Inspect image (Ubuntu & NVM variant)
+        run: |
+          docker buildx imagetools inspect "$IMAGE_NAME:$VERSION"
+        env:
+          IMAGE_NAME: "ghcr.io/${{ github.repository }}/echidna"
+          VERSION: "${{ steps.meta-ubuntu.outputs.version }}"
